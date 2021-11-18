@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import time
 from tqdm import tqdm
-from .Base import BaseModel
 from sklearn.metrics import r2_score
 from collections import defaultdict as ddict
 

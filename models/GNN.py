@@ -13,124 +13,45 @@ from .Base import BaseModel
 from torch.autograd import Variable
 from collections import defaultdict as ddict
 from .MLP import MLPRegressor
+from sklearn import preprocessing
+from dgl.dataloading import GraphDataLoader
+from sklearn.metrics import roc_auc_score, auc
 
+class ArcFace(nn.Module):
+    def __init__(self, in_dim, out_dim, s=4.0, m=0.5):
+        super(ArcFace, self).__init__()
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_dim, in_dim))
+        nn.init.xavier_uniform_(self.weight)
 
-class ElementWiseLinear(nn.Module):
-    def __init__(self, size, weight=True, bias=True, inplace=False):
-        super().__init__()
-        if weight:
-            self.weight = nn.Parameter(torch.Tensor(size))
-        else:
-            self.weight = None
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(size))
-        else:
-            self.bias = None
-        self.inplace = inplace
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if self.weight is not None:
-            nn.init.ones_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, x):
-        if self.inplace:
-            if self.weight is not None:
-                x.mul_(self.weight)
-            if self.bias is not None:
-                x.add_(self.bias)
-        else:
-            if self.weight is not None:
-                x = x * self.weight
-            if self.bias is not None:
-                x = x + self.bias
-        return x
-
-class GATDGL(torch.nn.Module):
-    '''
-    Implementation of leaderboard GAT network for OGB datasets.
-    https://github.com/Espylapiza/dgl/blob/master/examples/pytorch/ogb/ogbn-arxiv/models.py
-    '''
-    def __init__(
-        self,
-        in_feats,
-        n_classes,
-        n_layers=3,
-        n_heads=3,
-        activation=F.relu,
-        n_hidden=250,
-        dropout=0.75,
-        input_drop=0.1,
-        attn_drop=0.0,
-    ):
-        super().__init__()
-        self.in_feats = in_feats
-        self.n_hidden = n_hidden
-        self.n_classes = n_classes
-        self.n_layers = n_layers
-        self.num_heads = n_heads
-
-        self.convs = torch.nn.ModuleList()
-        self.norms = torch.nn.ModuleList()
-
-        for i in range(n_layers):
-            in_hidden = n_heads * n_hidden if i > 0 else in_feats
-            out_hidden = n_hidden if i < n_layers - 1 else n_classes
-            num_heads = n_heads if i < n_layers - 1 else 1
-            out_channels = n_heads
-
-            self.convs.append(
-                GATConvDGL(
-                    in_hidden,
-                    out_hidden,
-                    num_heads=num_heads,
-                    attn_drop=attn_drop,
-                    residual=True,
-                )
-            )
-
-            if i < n_layers - 1:
-                self.norms.append(torch.nn.BatchNorm1d(out_channels * out_hidden))
-
-        self.bias_last = ElementWiseLinear(n_classes, weight=False, bias=True, inplace=True)
-
-        self.input_drop = nn.Dropout(input_drop)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = activation
-
-    def forward(self, graph, feat):
-        h = feat
-        h = self.input_drop(h)
-
-        for i in range(self.n_layers):
-            conv = self.convs[i](graph, h)
-
-            h = conv
-
-            if i < self.n_layers - 1:
-                h = h.flatten(1)
-                h = self.norms[i](h)
-                h = self.activation(h, inplace=True)
-                h = self.dropout(h)
-
-        h = h.mean(1)
-        h = self.bias_last(h)
-
-        return h
-
-
+    def forward(self, inputs, labels, m=None):
+        cosine1 = F.linear(F.normalize(inputs), F.normalize(self.weight))
+#         index = torch.where(labels != -1)[0]
+        m_hot = torch.zeros(cosine1.shape, device=cosine1.device)
+        if m is None:
+            m_hot.scatter_(1, labels[:, None], self.m)
+        ac = torch.acos(cosine1)
+        ac += m_hot
+        cosine = torch.cos(ac).mul_(self.s)
+        return cosine
 
 class GNNModelDGL(torch.nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim,
-                 dropout=0., name='gat', residual=True, use_mlp=False, join_with_mlp=False):
+    def __init__(self, in_dim, hidden_dim, out_dim, with_arcface,
+                 dropout=0., name='gat', residual=True, use_mlp=False, join_with_mlp=False,
+                 n_classes=None, s=None, m=None):
         super(GNNModelDGL, self).__init__()
         self.name = name
         self.use_mlp = use_mlp
         self.join_with_mlp = join_with_mlp
         self.normalize_input_columns = True
+
+        self.with_arcface = with_arcface
+        if with_arcface:
+            assert s is not None, "Forgot to specify s parameter"
+            assert m is not None, "Forgot to specify m parameter"
+            self.arcface = ArcFace(hidden_dim, n_classes, s, m)
+
         if use_mlp:
             self.mlp = MLPRegressor(in_dim, hidden_dim, out_dim)
             if join_with_mlp:
@@ -160,7 +81,7 @@ class GNNModelDGL(torch.nn.Module):
             self.l1 = APPNPConv(k=10, alpha=0.1, edge_drop=0.)
 
 
-    def forward(self, graph, features):
+    def forward(self, graph, features, labels=None, emb_only=False, m=None):
         h = features
         if self.use_mlp:
             if self.join_with_mlp:
@@ -183,83 +104,30 @@ class GNNModelDGL(torch.nn.Module):
             h = self.l1(graph, h)
             logits = self.l2(graph, h)
 
+        with graph.local_scope():
+            graph.ndata['h'] = logits
+            graph_embedding = dgl.mean_nodes(graph, 'h')
+
+            if emb_only:
+                return graph_embedding
+
+            if self.with_arcface:
+                return self.arcface(graph_embedding, labels, m)
+            else:
+                return self.classify(graph_embedding)
+
         return logits
 
-class GNNModelPYG(torch.nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim,
-                 dropout=0.5, name='gat',
-                 heads=8, residual=True):
-        super(GNNModelPYG, self).__init__()
-        self.dropout = dropout
-        self.name = name
-        self.residual = None
-        if residual:
-            if in_dim == out_dim:
-                self.residual = Identity()
-            else:
-                self.residual = Linear(in_dim, out_dim)
-
-        if name == 'gat':
-            self.conv1 = GATConv(in_dim, hidden_dim, heads=heads, dropout=dropout)
-            self.conv2 = GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=dropout)
-        elif name == 'gcn':
-            self.conv1 = GCNConv(in_dim, hidden_dim, cached=True, normalize=True, add_self_loops=False)
-            self.conv2 = GCNConv(hidden_dim, out_dim, cached=True, normalize=True, add_self_loops=False)
-        elif name == 'cheb':
-            self.conv1 = ChebConv(in_dim, hidden_dim, K=2)
-            self.conv2 = ChebConv(hidden_dim, out_dim, K=2)
-        elif name == 'spline':
-            self.conv1 = SplineConv(in_dim, hidden_dim, dim=1, kernel_size=2)
-            self.conv2 = SplineConv(hidden_dim, out_dim, dim=1, kernel_size=2)
-        elif name == 'gin':
-            self.conv1 = GINConv(Sequential(Linear(in_dim, hidden_dim),
-                                            ReLU(), Linear(hidden_dim, hidden_dim)))
-            self.conv2 = GINConv(Sequential(Linear(hidden_dim, hidden_dim),
-                                            ReLU(), Linear(hidden_dim, out_dim)))
-        elif name == 'unet':
-            self.conv1 = GraphUNet(in_dim, hidden_dim, out_dim, depth=3)
-        elif name == 'agnn':
-            self.lin1 = Linear(in_dim, hidden_dim)
-            self.conv1 = AGNNConv(requires_grad=False)
-            self.conv2 = AGNNConv(requires_grad=True)
-            self.lin2 = Linear(hidden_dim, out_dim)
-        else:
-            raise NotImplemented("""
-            Unknown model name. Choose from gat, gcn, cheb, spline, gin, unet, agnn.""")
-
-    def forward(self, graph, features):
-        x, edge_index, edge_attr = features, graph.edge_index, graph.edge_attr
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        model_in = [x, edge_index]
-        if self.name in ['spline']: # use edge attributes
-            model_in.append(edge_attr)
-
-        if self.name in ['unet']: # only one layer (net)
-            x = self.conv1(*model_in)
-        elif self.name in ['agnn']:
-            x = F.elu(self.conv1(self.lin1(x), edge_index))
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            x = self.lin2(self.conv2(x, edge_index))
-        else:
-            x = F.elu(self.conv1(*model_in))
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            model_in[0] = x
-            x = self.conv2(*model_in)
-        if self.residual is not None:
-            x += self.residual(features)
-        return x
-
-
 class GNN(BaseModel):
-    def __init__(self, task='regression', lr=0.01, hidden_dim=64, dropout=0.,
+    def __init__(self, with_arcface, lr=0.01, hidden_dim=64, dropout=0.,
                  name='gat', residual=True, lang='dgl',
-                gbdt_predictions=None, mlp=False, use_leaderboard=False, only_gbdt=False):
+                gbdt_predictions=None, mlp=False, use_leaderboard=False, only_gbdt=False, s=None, m=None):
         super(GNN, self).__init__()
 
+        self.with_arcface = with_arcface
         self.dropout = dropout
         self.learning_rate = lr
         self.hidden_dim = hidden_dim
-        self.task = task
         self.model_name = name
         self.use_residual = residual
         self.lang = lang
@@ -267,6 +135,8 @@ class GNN(BaseModel):
         self.use_leaderboard = use_leaderboard
         self.gbdt_predictions = gbdt_predictions
         self.only_gbdt = only_gbdt
+        s = self.s
+        m = self.m
 
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -277,96 +147,251 @@ class GNN(BaseModel):
             return 'ResGNN'
 
     def init_model(self):
-        if self.lang == 'pyg':
-            self.model = GNNModelPYG(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
-                                  heads=self.heads, dropout=self.dropout, name=self.model_name,
-                                  residual=self.use_residual).to(self.device)
-        elif self.lang == 'dgl':
-            if self.use_leaderboard:
-                self.model = GATDGL(in_feats=self.in_dim, n_classes=self.out_dim).to(self.device)
-            else:
-                self.model = GNNModelDGL(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
-                                         dropout=self.dropout, name=self.model_name,
-                                         residual=self.use_residual, use_mlp=self.use_mlp,
-                                         join_with_mlp=self.use_mlp).to(self.device)
+        self.model = GNNModelDGL(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
+                                 with_arcface=self.with_arcface,
+                                 dropout=self.dropout, name=self.model_name,
+                                 residual=self.use_residual, use_mlp=self.use_mlp,
+                                 join_with_mlp=self.use_mlp,
+                                 n_classes=self.out_dim, s=self.s, m=self.m
+                                 ).to(self.device)
 
-    def init_node_features(self, X, optimize_node_features):
-        node_features = Variable(X, requires_grad=optimize_node_features)
-        return node_features
+    def train_model(self, loader, feat_name):
+        self.model.train()
 
-    def fit(self, networkx_graph, X, y, train_mask, val_mask, test_mask, num_epochs,
-            cat_features=None, patience=200, logging_epochs=1, optimize_node_features=False,
-            loss_fn=None, metric_name='loss', normalize_features=True, replace_na=True):
+        for gs, ls in loader:
+            gs = gs.to(self.device)
+            ls = ls.to(self.device)
+            feats = gs.ndata[feat_name].float()
+            logits = self.model(gs, feats, ls)
+            loss = F.cross_entropy(logits, ls)
 
-        # initialize for early stopping and metrics
-        if metric_name in ['r2', 'accuracy']:
-            best_metric = [np.float('-inf')] * 3  # for train/val/test
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+        return loss.item()
+
+    def evaluate_model(self, loader, feat_name):
+        self.model.eval()
+
+        elements = 0
+        accs = 0
+        losses = []
+        for gs, ls in loader:
+            gs = gs.to(self.device)
+            ls = ls.to(self.device)
+            feats = gs.ndata[feat_name].float()
+            logits = self.model(gs, feats, ls, m=0).squeeze()
+            losses.append(F.cross_entropy(logits, ls.long()).cpu().detach().item())
+            accs += (ls == logits.max(1)[1]).sum()
+            elements += ls.shape[0]
+
+        return np.mean(losses), accs.detach().item() / elements
+
+    def init_optimizer(self):
+        self.opt = torch.optim.Adam(self.model.parameters())
+
+    def compute_auc_roc(self, loader1, loader2, test_labels, feat_name):
+
+        for g in loader1:
+            g = g.to(self.device)
+            feats = g.ndata[feat_name].float()
+            emb1 = self.model(g, feats, labels=None, emb_only=True)
+
+        for g in loader2:
+            g = g.to(self.device)
+            feats = g.ndata[feat_name].float()
+            emb2 = self.model(g, feats, labels=None, emb_only=True)
+
+        test_scores = (F.normalize(emb1) * F.normalize(emb2)).sum(1)
+        return roc_auc_score(test_labels, test_scores.detach().cpu()), test_scores
+
+    def find_thresholds_by_FAR(self, score_vec, label_vec, FARs=None, epsilon=1e-8):
+        """
+        Find thresholds given FARs
+        but the real FARs using these thresholds could be different
+        the exact FARs need to recomputed using calcROC
+        """
+        assert len(score_vec.shape) == 1
+        assert score_vec.shape == label_vec.shape
+        assert label_vec.dtype == np.bool
+        score_neg = score_vec[~label_vec]
+        score_neg[::-1].sort()
+        num_neg = len(score_neg)
+
+        assert num_neg >= 1
+
+        if FARs is None:
+            thresholds = np.unique(score_neg)
+            thresholds = np.insert(thresholds, 0, thresholds[0] + epsilon)
+            thresholds = np.insert(thresholds, thresholds.size, thresholds[-1] - epsilon)
         else:
-            best_metric = [np.float('inf')] * 3  # for train/val/test
-        best_val_epoch = 0
-        epochs_since_last_best_metric = 0
-        metrics = ddict(list) # metric_name -> (train/val/test)
-        if cat_features is None:
-            cat_features = []
+            FARs = np.array(FARs)
+            num_false_alarms = np.round(num_neg * FARs).astype(np.int32)
 
-        if self.gbdt_predictions is not None:
-            X = X.copy()
-            X['predict'] = self.gbdt_predictions
-            if self.only_gbdt:
-                cat_features = []
-                X = X[['predict']]
+            thresholds = []
+            for num_false_alarm in num_false_alarms:
+                if num_false_alarm == 0:
+                    threshold = score_neg[0] + epsilon
+                else:
+                    threshold = score_neg[num_false_alarm - 1]
+                thresholds.append(threshold)
+            thresholds = np.array(thresholds)
 
-        self.in_dim = X.shape[1]
-        self.hidden_dim = self.hidden_dim
-        if self.task == 'regression':
-            self.out_dim = y.shape[1]
-        elif self.task == 'classification':
-            self.out_dim = len(set(y.iloc[:, 0]))
+        return thresholds
 
-        if len(cat_features):
-            X = self.encode_cat_features(X, y, cat_features, train_mask, val_mask, test_mask)
-        if normalize_features:
-            X = self.normalize_features(X, train_mask, val_mask, test_mask)
-        if replace_na:
-            X = self.replace_na(X, train_mask)
+    def ROC(self, score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False):
+        """
+        Compute Receiver operating characteristic (ROC) with a score and label vector.
+        """
+        assert score_vec.ndim == 1
+        assert score_vec.shape == label_vec.shape
+        assert label_vec.dtype == np.bool
 
-        X, y = self.pandas_to_torch(X, y)
-        if len(X.shape) == 1:
-            X = X.unsqueeze(1)
+        if thresholds is None:
+            thresholds = self.find_thresholds_by_FAR(score_vec, label_vec, FARs=FARs)
 
-        if self.lang == 'dgl':
-            graph = self.networkx_to_torch(networkx_graph)
-        elif self.lang == 'pyg':
-            graph = self.networkx_to_torch2(networkx_graph)
+        assert len(thresholds.shape) == 1
+
+        # FARs would be check again
+        TARs = np.zeros(thresholds.shape[0])
+        FARs = np.zeros(thresholds.shape[0])
+        false_accept_indices = []
+        false_reject_indices = []
+        for i, threshold in enumerate(thresholds):
+            accept = score_vec >= threshold
+            TARs[i] = np.mean(accept[label_vec])
+            FARs[i] = np.mean(accept[~label_vec])
+            if get_false_indices:
+                false_accept_indices.append(np.argwhere(accept & (~label_vec)).flatten())
+                false_reject_indices.append(np.argwhere((~accept) & label_vec).flatten())
+
+        if get_false_indices:
+            return TARs, FARs, thresholds, false_accept_indices, false_reject_indices
+        else:
+            return TARs, FARs, thresholds
+
+    def compute_auc_tar_far(self, scores, labels, far_upper=0.2, to_show=False, output_fn=None):
+
+        score_vec = scores.cpu().detach().numpy()
+        label_vec = np.array(labels).astype(bool)
+        TARs, FARs, thresholds = self.ROC(score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False)
+
+        idxs = np.where(FARs <= far_upper)[0]
+        xvals = FARs[idxs]
+        yvals = TARs[idxs]
+
+        aucscore = auc(xvals, yvals)
+
+        if to_show:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=xvals, y=yvals,
+                                     mode='lines+markers'))
+            fig.update_layout(
+                title=f'FAR vs TAR: {aucscore:.4f}',
+                title_x=0.5,
+                xaxis_title='Epoch',
+                yaxis_title='',
+                font=dict(
+                    size=40,
+                ),
+                #     height=600,
+            )
+            fig.show()
+            fig.write_image(output_fn) if output_fn else None
+
+        return aucscore, FARs, TARs
+
+    def plot_interactive(self, metrics_list, legend=['Train', 'Val', 'Test'], title='', logx=False, logy=False,
+                         metric_name='loss', start_from=0, output_fn=None, to_show=True):
+
+        fig = go.Figure()
+        dash_opt = ['dash', 'dot']
+
+        for mi, metrics in enumerate(metrics_list):
+            metric_results = metrics[metric_name]
+            xs = [list(range(len(metric_results)))] * len(metric_results[0])
+            ys = list(zip(*metric_results))
+
+            for i in range(len(ys)):
+                fig.add_trace(go.Scatter(x=xs[i][start_from:], y=ys[i][start_from:],
+                                         mode='lines+markers',
+                                         name=legend[i + mi * 3], line={'dash': dash_opt[mi]}))
+
+        fig.update_layout(
+            title=title,
+            title_x=0.5,
+            xaxis_title='Epoch',
+            yaxis_title='',
+            font=dict(
+                size=40,
+            ),
+            height=600,
+        )
+
+        if logx:
+            fig.update_layout(xaxis_type="log")
+        if logy:
+            fig.update_layout(yaxis_type="log")
+
+        #     plt.savefig(output_fn, bbox_inches='tight') if output_fn else None
+        fig.write_image(output_fn) if output_fn else None
+        if to_show:
+            fig.show()
+
+    def save_metrics(self, metrics, fn):
+        if fn is not None:
+            with open(fn, "w+") as f:
+                for key, value in metrics.items():
+                    print(key, value, file=f)
+
+    def fit(self, train_graphs, train_labels, test_graphs1, test_graphs2, test_labels, num_epochs,
+            output_fn=None):
+
+        # TODO: try this new class working
+
+        torch.manual_seed(0)
+        np.random.seed(0)
+
+        data = list(zip(train_graphs, train_labels))
+        np.random.shuffle(data)
+
+        trainloader = GraphDataLoader(data[:int(.9 * len(data))], batch_size=int(.9 * len(data)), drop_last=False,
+                                      shuffle=True)
+        testloader = GraphDataLoader(data[int(.9 * len(data)):], batch_size=len(data[int(.9 * len(data)):]),
+                                     drop_last=False, shuffle=False)
+
+        testloader1 = GraphDataLoader(test_graphs1, batch_size=len(test_graphs1), drop_last=False, shuffle=False)
+        testloader2 = GraphDataLoader(test_graphs2, batch_size=len(test_graphs2), drop_last=False, shuffle=False)
+
+        feat_name = 'node_attr'  # 'node_attr'
+        edge_name = None  # 'edge_labels'
+
+        self.device = torch.device(f'cuda:{0}')
+        # device = torch.device('cpu')
+
+        self.in_dim = train_graphs[0].ndata[feat_name].shape[1]
+        self.hidden_dim = 128
+        self.out_dim = np.unique(train_labels).shape[0]
+
+        far_upper = 0.2
+
         self.init_model()
-        node_features = self.init_node_features(X, optimize_node_features)
+        self.init_optimizer()
 
-        self.node_features = node_features
-        self.graph = graph
-        optimizer = self.init_optimizer(node_features, optimize_node_features, self.learning_rate)
+        metrics = ddict(list)
 
-        pbar = tqdm(range(num_epochs))
-        for epoch in pbar:
-            start2epoch = time.time()
+        for epoch in range(num_epochs):
+            self.train_model(trainloader, feat_name)
 
-            model_in = (graph, node_features)
-            loss = self.train_and_evaluate(model_in, y, train_mask, val_mask, test_mask, optimizer,
-                                           metrics, gnn_passes_per_epoch=1)
-            self.log_epoch(pbar, metrics, epoch, loss, time.time() - start2epoch, logging_epochs,
-                           metric_name=metric_name)
+            loss1, acc1 = self.evaluate_model(trainloader, feat_name)
+            loss2, acc2 = self.evaluate_model(testloader, feat_name)
 
-            # check early stopping
-            best_metric, best_val_epoch, epochs_since_last_best_metric = \
-                self.update_early_stopping(metrics, epoch, best_metric, best_val_epoch, epochs_since_last_best_metric,
-                                           metric_name, lower_better=(metric_name not in ['r2', 'accuracy']))
-            if patience and epochs_since_last_best_metric > patience:
-                break
+            roc_auc, test_scores = self.compute_auc_roc(testloader1, testloader2, test_labels, feat_name)
+            tarfar_auc, FARs, TARs = self.compute_auc_tar_far(test_scores, test_labels, far_upper=far_upper, to_show=False, output_fn=None)
 
-        if loss_fn:
-            self.save_metrics(metrics, loss_fn)
+            metrics['auc'].append((roc_auc,))
+            metrics['tar_auc'].append((tarfar_auc,))
+            metrics['acc'].append((acc1, acc2))
+            metrics['loss'].append((loss1, loss2))
 
-        print('Best {} at iteration {}: {:.3f}/{:.3f}/{:.3f}'.format(metric_name, best_val_epoch, *best_metric))
-        return metrics
-
-    def predict(self, graph, node_features, target_labels, test_mask):
-        return self.evaluate_model((graph, node_features), target_labels, test_mask)
+        self.save_metrics(metrics, output_fn)
