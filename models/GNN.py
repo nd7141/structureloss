@@ -1,21 +1,23 @@
-import time
-import numpy as np
-import torch
-from torch.nn import Dropout, ELU
-import torch.nn.functional as F
-from torch import nn
-from dgl.nn.pytorch import GATConv as GATConvDGL, GraphConv, ChebConv as ChebConvDGL, \
-    AGNNConv as AGNNConvDGL, APPNPConv
-from torch_geometric.nn import GATConv, SplineConv, GCNConv, ChebConv, GINConv, GraphUNet, AGNNConv
-from torch.nn import Sequential, Linear, ReLU, Identity
-from tqdm import tqdm
-from .Base import BaseModel
-from torch.autograd import Variable
 from collections import defaultdict as ddict
-from .MLP import MLPRegressor
-from sklearn import preprocessing
+
+import dgl
+import numpy as np
+import plotly.graph_objects as go
+import torch
+import torch.nn.functional as F
 from dgl.dataloading import GraphDataLoader
-from sklearn.metrics import roc_auc_score, auc
+from dgl.nn.pytorch import AGNNConv as AGNNConvDGL
+from dgl.nn.pytorch import APPNPConv
+from dgl.nn.pytorch import ChebConv as ChebConvDGL
+from dgl.nn.pytorch import GATConv as GATConvDGL
+from dgl.nn.pytorch import GraphConv
+from sklearn.metrics import auc, roc_auc_score
+from torch import nn
+from torch.nn import ELU, Dropout, Linear, ReLU, Sequential
+
+from .MLP import MLPRegressor
+from .models import BaseModel
+
 
 class ArcFace(nn.Module):
     def __init__(self, in_dim, out_dim, s=4.0, m=0.5):
@@ -27,8 +29,8 @@ class ArcFace(nn.Module):
 
     def forward(self, inputs, labels, m=None):
         cosine1 = F.linear(F.normalize(inputs), F.normalize(self.weight))
-#         index = torch.where(labels != -1)[0]
-        m_hot = torch.zeros(cosine1.shape, device=cosine1.device)
+        #         index = torch.where(labels != -1)[0]
+        m_hot = torch.zeros(cosine1.size(), device=cosine1.device)
         if m is None:
             m_hot.scatter_(1, labels[:, None], self.m)
         ac = torch.acos(cosine1)
@@ -36,10 +38,23 @@ class ArcFace(nn.Module):
         cosine = torch.cos(ac).mul_(self.s)
         return cosine
 
+
 class GNNModelDGL(torch.nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, with_arcface,
-                 dropout=0., name='gat', residual=True, use_mlp=False, join_with_mlp=False,
-                 n_classes=None, s=None, m=None):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        out_dim,
+        with_arcface,
+        dropout=0.0,
+        name="gat",
+        residual=True,
+        use_mlp=False,
+        join_with_mlp=False,
+        n_classes=None,
+        s=None,
+        m=None,
+    ):
         super(GNNModelDGL, self).__init__()
         self.name = name
         self.use_mlp = use_mlp
@@ -58,28 +73,51 @@ class GNNModelDGL(torch.nn.Module):
                 in_dim += out_dim
             else:
                 in_dim = out_dim
-        if name == 'gat':
-            self.l1 = GATConvDGL(in_dim, hidden_dim//8, 8, feat_drop=dropout, attn_drop=dropout, residual=False,
-                              activation=F.elu)
-            self.l2 = GATConvDGL(hidden_dim, out_dim, 1, feat_drop=dropout, attn_drop=dropout, residual=residual, activation=None)
-        elif name == 'gcn':
+        if name == "gat":
+            self.l1 = GATConvDGL(
+                in_dim,
+                hidden_dim // 8,
+                8,
+                feat_drop=dropout,
+                attn_drop=dropout,
+                residual=False,
+                activation=F.elu,
+            )
+            self.l2 = GATConvDGL(
+                hidden_dim,
+                out_dim,
+                1,
+                feat_drop=dropout,
+                attn_drop=dropout,
+                residual=residual,
+                activation=None,
+            )
+        elif name == "gcn":
             self.l1 = GraphConv(in_dim, hidden_dim, activation=F.elu)
             self.l2 = GraphConv(hidden_dim, out_dim, activation=F.elu)
             self.drop = Dropout(p=dropout)
-        elif name == 'cheb':
-            self.l1 = ChebConvDGL(in_dim, hidden_dim, k = 3)
-            self.l2 = ChebConvDGL(hidden_dim, out_dim, k = 3)
+        elif name == "cheb":
+            self.l1 = ChebConvDGL(in_dim, hidden_dim, k=3)
+            self.l2 = ChebConvDGL(hidden_dim, out_dim, k=3)
             self.drop = Dropout(p=dropout)
-        elif name == 'agnn':
-            self.lin1 = Sequential(Dropout(p=dropout), Linear(in_dim, hidden_dim), ELU())
+        elif name == "agnn":
+            self.lin1 = Sequential(
+                Dropout(p=dropout), Linear(in_dim, hidden_dim), ELU()
+            )
             self.l1 = AGNNConvDGL(learn_beta=False)
             self.l2 = AGNNConvDGL(learn_beta=True)
-            self.lin2 = Sequential(Dropout(p=dropout), Linear(hidden_dim, out_dim), ELU())
-        elif name == 'appnp':
-            self.lin1 = Sequential(Dropout(p=dropout), Linear(in_dim, hidden_dim),
-                       ReLU(), Dropout(p=dropout), Linear(hidden_dim, out_dim))
-            self.l1 = APPNPConv(k=10, alpha=0.1, edge_drop=0.)
-
+            self.lin2 = Sequential(
+                Dropout(p=dropout), Linear(hidden_dim, out_dim), ELU()
+            )
+        elif name == "appnp":
+            self.lin1 = Sequential(
+                Dropout(p=dropout),
+                Linear(in_dim, hidden_dim),
+                ReLU(),
+                Dropout(p=dropout),
+                Linear(hidden_dim, out_dim),
+            )
+            self.l1 = APPNPConv(k=10, alpha=0.1, edge_drop=0.0)
 
     def forward(self, graph, features, labels=None, emb_only=False, m=None):
         h = features
@@ -88,25 +126,25 @@ class GNNModelDGL(torch.nn.Module):
                 h = torch.cat((h, self.mlp(features)), 1)
             else:
                 h = self.mlp(features)
-        if self.name == 'gat':
+        if self.name == "gat":
             h = self.l1(graph, h).flatten(1)
             logits = self.l2(graph, h).mean(1)
-        elif self.name in ['appnp']:
+        elif self.name in ["appnp"]:
             h = self.lin1(h)
             logits = self.l1(graph, h)
-        elif self.name == 'agnn':
+        elif self.name == "agnn":
             h = self.lin1(h)
             h = self.l1(graph, h)
             h = self.l2(graph, h)
             logits = self.lin2(h)
-        elif self.name in ['gcn', 'cheb']:
+        elif self.name in ["gcn", "cheb"]:
             h = self.drop(h)
             h = self.l1(graph, h)
             logits = self.l2(graph, h)
 
         with graph.local_scope():
-            graph.ndata['h'] = logits
-            graph_embedding = dgl.mean_nodes(graph, 'h')
+            graph.ndata["h"] = logits
+            graph_embedding = dgl.mean_nodes(graph, "h")
 
             if emb_only:
                 return graph_embedding
@@ -118,10 +156,24 @@ class GNNModelDGL(torch.nn.Module):
 
         return logits
 
+
 class GNN(BaseModel):
-    def __init__(self, with_arcface, lr=0.01, hidden_dim=64, dropout=0.,
-                 name='gat', residual=True, lang='dgl',
-                gbdt_predictions=None, mlp=False, use_leaderboard=False, only_gbdt=False, s=None, m=None):
+    def __init__(
+        self,
+        with_arcface,
+        lr=0.01,
+        hidden_dim=64,
+        dropout=0.0,
+        name="gat",
+        residual=True,
+        lang="dgl",
+        gbdt_predictions=None,
+        mlp=False,
+        use_leaderboard=False,
+        only_gbdt=False,
+        s=None,
+        m=None,
+    ):
         super(GNN, self).__init__()
 
         self.with_arcface = with_arcface
@@ -135,25 +187,32 @@ class GNN(BaseModel):
         self.use_leaderboard = use_leaderboard
         self.gbdt_predictions = gbdt_predictions
         self.only_gbdt = only_gbdt
-        s = self.s
-        m = self.m
+        self.s = s
+        self.m = m
 
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
     def __name__(self):
         if self.gbdt_predictions is None:
-            return 'GNN'
+            return "GNN"
         else:
-            return 'ResGNN'
+            return "ResGNN"
 
     def init_model(self):
-        self.model = GNNModelDGL(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
-                                 with_arcface=self.with_arcface,
-                                 dropout=self.dropout, name=self.model_name,
-                                 residual=self.use_residual, use_mlp=self.use_mlp,
-                                 join_with_mlp=self.use_mlp,
-                                 n_classes=self.out_dim, s=self.s, m=self.m
-                                 ).to(self.device)
+        self.model = GNNModelDGL(
+            in_dim=self.in_dim,
+            hidden_dim=self.hidden_dim,
+            out_dim=self.out_dim,
+            with_arcface=self.with_arcface,
+            dropout=self.dropout,
+            name=self.model_name,
+            residual=self.use_residual,
+            use_mlp=self.use_mlp,
+            join_with_mlp=self.use_mlp,
+            n_classes=self.out_dim,
+            s=self.s,
+            m=self.m,
+        ).to(self.device)
 
     def train_model(self, loader, feat_name):
         self.model.train()
@@ -188,7 +247,9 @@ class GNN(BaseModel):
         return np.mean(losses), accs.detach().item() / elements
 
     def init_optimizer(self):
-        self.opt = torch.optim.Adam(self.model.parameters())
+        self.opt = torch.optim.Adam(
+            self.model.parameters(), lr=self.learning_rate, weight_decay=3e-4
+        )
 
     def compute_auc_roc(self, loader1, loader2, test_labels, feat_name):
 
@@ -223,7 +284,9 @@ class GNN(BaseModel):
         if FARs is None:
             thresholds = np.unique(score_neg)
             thresholds = np.insert(thresholds, 0, thresholds[0] + epsilon)
-            thresholds = np.insert(thresholds, thresholds.size, thresholds[-1] - epsilon)
+            thresholds = np.insert(
+                thresholds, thresholds.size, thresholds[-1] - epsilon
+            )
         else:
             FARs = np.array(FARs)
             num_false_alarms = np.round(num_neg * FARs).astype(np.int32)
@@ -239,7 +302,9 @@ class GNN(BaseModel):
 
         return thresholds
 
-    def ROC(self, score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False):
+    def ROC(
+        self, score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False
+    ):
         """
         Compute Receiver operating characteristic (ROC) with a score and label vector.
         """
@@ -262,19 +327,27 @@ class GNN(BaseModel):
             TARs[i] = np.mean(accept[label_vec])
             FARs[i] = np.mean(accept[~label_vec])
             if get_false_indices:
-                false_accept_indices.append(np.argwhere(accept & (~label_vec)).flatten())
-                false_reject_indices.append(np.argwhere((~accept) & label_vec).flatten())
+                false_accept_indices.append(
+                    np.argwhere(accept & (~label_vec)).flatten()
+                )
+                false_reject_indices.append(
+                    np.argwhere((~accept) & label_vec).flatten()
+                )
 
         if get_false_indices:
             return TARs, FARs, thresholds, false_accept_indices, false_reject_indices
         else:
             return TARs, FARs, thresholds
 
-    def compute_auc_tar_far(self, scores, labels, far_upper=0.2, to_show=False, output_fn=None):
+    def compute_auc_tar_far(
+        self, scores, labels, far_upper=0.2, to_show=False, output_fn=None
+    ):
 
         score_vec = scores.cpu().detach().numpy()
         label_vec = np.array(labels).astype(bool)
-        TARs, FARs, thresholds = self.ROC(score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False)
+        TARs, FARs, thresholds = self.ROC(
+            score_vec, label_vec, thresholds=None, FARs=None, get_false_indices=False
+        )
 
         idxs = np.where(FARs <= far_upper)[0]
         xvals = FARs[idxs]
@@ -284,13 +357,12 @@ class GNN(BaseModel):
 
         if to_show:
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=xvals, y=yvals,
-                                     mode='lines+markers'))
+            fig.add_trace(go.Scatter(x=xvals, y=yvals, mode="lines+markers"))
             fig.update_layout(
-                title=f'FAR vs TAR: {aucscore:.4f}',
+                title=f"FAR vs TAR: {aucscore:.4f}",
                 title_x=0.5,
-                xaxis_title='Epoch',
-                yaxis_title='',
+                xaxis_title="Epoch",
+                yaxis_title="",
                 font=dict(
                     size=40,
                 ),
@@ -301,11 +373,21 @@ class GNN(BaseModel):
 
         return aucscore, FARs, TARs
 
-    def plot_interactive(self, metrics_list, legend=['Train', 'Val', 'Test'], title='', logx=False, logy=False,
-                         metric_name='loss', start_from=0, output_fn=None, to_show=True):
+    def plot_interactive(
+        self,
+        metrics_list,
+        legend=["Train", "Val", "Test"],
+        title="",
+        logx=False,
+        logy=False,
+        metric_name="loss",
+        start_from=0,
+        output_fn=None,
+        to_show=True,
+    ):
 
         fig = go.Figure()
-        dash_opt = ['dash', 'dot']
+        dash_opt = ["dash", "dot"]
 
         for mi, metrics in enumerate(metrics_list):
             metric_results = metrics[metric_name]
@@ -313,15 +395,21 @@ class GNN(BaseModel):
             ys = list(zip(*metric_results))
 
             for i in range(len(ys)):
-                fig.add_trace(go.Scatter(x=xs[i][start_from:], y=ys[i][start_from:],
-                                         mode='lines+markers',
-                                         name=legend[i + mi * 3], line={'dash': dash_opt[mi]}))
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs[i][start_from:],
+                        y=ys[i][start_from:],
+                        mode="lines+markers",
+                        name=legend[i + mi * 3],
+                        line={"dash": dash_opt[mi]},
+                    )
+                )
 
         fig.update_layout(
             title=title,
             title_x=0.5,
-            xaxis_title='Epoch',
-            yaxis_title='',
+            xaxis_title="Epoch",
+            yaxis_title="",
             font=dict(
                 size=40,
             ),
@@ -344,8 +432,16 @@ class GNN(BaseModel):
                 for key, value in metrics.items():
                     print(key, value, file=f)
 
-    def fit(self, train_graphs, train_labels, test_graphs1, test_graphs2, test_labels, num_epochs,
-            output_fn=None):
+    def fit(
+        self,
+        train_graphs,
+        train_labels,
+        test_graphs1,
+        test_graphs2,
+        test_labels,
+        num_epochs,
+        output_fn=None,
+    ):
 
         # TODO: try this new class working
 
@@ -355,18 +451,30 @@ class GNN(BaseModel):
         data = list(zip(train_graphs, train_labels))
         np.random.shuffle(data)
 
-        trainloader = GraphDataLoader(data[:int(.9 * len(data))], batch_size=int(.9 * len(data)), drop_last=False,
-                                      shuffle=True)
-        testloader = GraphDataLoader(data[int(.9 * len(data)):], batch_size=len(data[int(.9 * len(data)):]),
-                                     drop_last=False, shuffle=False)
+        trainloader = GraphDataLoader(
+            data[: int(0.9 * len(data))],
+            batch_size=int(0.9 * len(data)),
+            drop_last=False,
+            shuffle=True,
+        )
+        testloader = GraphDataLoader(
+            data[int(0.9 * len(data)) :],
+            batch_size=len(data[int(0.9 * len(data)) :]),
+            drop_last=False,
+            shuffle=False,
+        )
 
-        testloader1 = GraphDataLoader(test_graphs1, batch_size=len(test_graphs1), drop_last=False, shuffle=False)
-        testloader2 = GraphDataLoader(test_graphs2, batch_size=len(test_graphs2), drop_last=False, shuffle=False)
+        testloader1 = GraphDataLoader(
+            test_graphs1, batch_size=len(test_graphs1), drop_last=False, shuffle=False
+        )
+        testloader2 = GraphDataLoader(
+            test_graphs2, batch_size=len(test_graphs2), drop_last=False, shuffle=False
+        )
 
-        feat_name = 'node_attr'  # 'node_attr'
-        edge_name = None  # 'edge_labels'
+        feat_name = "node_attr"  # 'node_attr'
+        # edge_name = None  # 'edge_labels'
 
-        self.device = torch.device(f'cuda:{0}')
+        self.device = torch.device(f"cuda:{2}")
         # device = torch.device('cpu')
 
         self.in_dim = train_graphs[0].ndata[feat_name].shape[1]
@@ -386,12 +494,20 @@ class GNN(BaseModel):
             loss1, acc1 = self.evaluate_model(trainloader, feat_name)
             loss2, acc2 = self.evaluate_model(testloader, feat_name)
 
-            roc_auc, test_scores = self.compute_auc_roc(testloader1, testloader2, test_labels, feat_name)
-            tarfar_auc, FARs, TARs = self.compute_auc_tar_far(test_scores, test_labels, far_upper=far_upper, to_show=False, output_fn=None)
+            roc_auc, test_scores = self.compute_auc_roc(
+                testloader1, testloader2, test_labels, feat_name
+            )
+            tarfar_auc, FARs, TARs = self.compute_auc_tar_far(
+                test_scores,
+                test_labels,
+                far_upper=far_upper,
+                to_show=False,
+                output_fn=None,
+            )
 
-            metrics['auc'].append((roc_auc,))
-            metrics['tar_auc'].append((tarfar_auc,))
-            metrics['acc'].append((acc1, acc2))
-            metrics['loss'].append((loss1, loss2))
+            metrics["auc"].append((roc_auc,))
+            metrics["tar_auc"].append((tarfar_auc,))
+            metrics["acc"].append((acc1, acc2))
+            metrics["loss"].append((loss1, loss2))
 
         self.save_metrics(metrics, output_fn)
